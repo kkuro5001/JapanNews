@@ -7,6 +7,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import datetime
 import requests
 import traceback
+import time
 from flask import Flask, jsonify, request, abort, make_response
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -15,7 +16,7 @@ import jwt
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_sqlalchemy import SQLAlchemy
 from db_models import db, User, UserActivity
-# from flask_jwt_extended import jwt_required # この行は使用していないのでコメントアウトまたは削除してもOKです
+from sqlalchemy.exc import OperationalError
 import secrets
 
 print(f'生成されたkey{secrets.token_urlsafe(32)}')
@@ -41,6 +42,9 @@ if not os.path.exists(instance_path):
 # 例: sqlite:////Users/youruser/your_project/JapanNewsAI/backend/instance/users.db
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(instance_path, 'users.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'connect_args' : {'timeout': 10}
+}
 db.init_app(app)
 
 # Blueprintの登録（ユーザー情報取得API）
@@ -268,6 +272,11 @@ def user_activity():
         return jsonify(success=False, error='トークンの有効期限が切れています'), 401
     except jwt.InvalidTokenError:
         return jsonify(success=False, error='無効なトークンです'), 400
+    # Added general exception handling for JWT issues if they occur before specific ones.
+    except Exception as e: # JWT検証中に予期せぬエラーが発生した場合の追加ハンドリング
+        print(f"ERROR: ユーザーアクティビティのJWT検証中に予期せぬエラーが発生しました: {e}")
+        return jsonify(success=False, error=f"認証エラー: {str(e)}"), 500
+
 
     activity_type = data.get('activity_type')
     article_id = data.get('article_id')
@@ -275,20 +284,45 @@ def user_activity():
     article_description = data.get('article_description')
 
     if not activity_type or not article_id:
-        return jsonify(success=False, error="activity_typeとarticle_idが必要です")
+        return jsonify(success=False, error="activity_typeとarticle_idが必要です"), 400
 
     activity = UserActivity(
         user_id=user_id,
         activity_type=activity_type,
-        article_id=article_id
+        article_id=article_id,
+        article_title=article_title,
+        article_description=article_description
     )
-    db.session.add(activity)
-    db.session.commit()
+    max_retries = 3
+    retry_delay_seconds = 0.1
+    for i in range(max_retries):
+        try:
+            db.session.add(activity)
+            db.session.commit()
+            print(f"DEBUG:ユーザーアクティビティがDBに正常に保存されました:"
+                f"User ID={user_id}, Type={activity_type}, Article ID={article_id}")
+            return jsonify(success=True, message="アクティビティを記録しました"), 200
+        except OperationalError as e:
+            db.session.rollback() # エラーが発生したらロールバック
+            # 「database is locked」エラーの場合、かつリトライ回数が残っている場合
+            if "database is locked" in str(e).lower() and i < max_retries - 1:
+                print(f"WARNING: データベースがロックされています。リトライします ({i+1}/{max_retries}). エラー: {e}")
+                time.sleep(retry_delay_seconds) # 少し待機
+            else:
+                # リトライ上限に達したか、ロック以外のOperationalErrorの場合
+                print(f"ERROR: データベース操作に失敗しました (リトライ上限に達したか、その他のOperationalError): {e}")
+                traceback.print_exc()
+                return jsonify(success=False, error=f"アクティビティ記録失敗: {str(e)}"), 500
+        except Exception as e:
+            # OperationalError以外の予期せぬエラーの場合
+            db.session.rollback()
+            print(f"ERROR:ユーザアクティビティのDB保存に失敗しました:{e}")
+            traceback.print_exc()
+            return jsonify(success=False, error=f"アクティビティ記録失敗:{str(e)}"), 500
 
-    # print(f"DEBUG: ユーザーアクティビティがDBに正常に保存されました: "
-    #           f"User ID={user_id}, Type={activity_type}, Article ID={article_id}")
+    # ここに到達した場合、すべてのリトライが失敗したことを意味する
+    return jsonify(success=False, error="アクティビティ記録が複数回失敗しました。時間をおいてお試しください。"), 500
 
-    return jsonify(success=True, message="アクティビティを記録しました")
 
 # ユーザーアクティビティをもとに推薦記事を取得するAPI
 @app.route('/api/recommendations', methods=['GET'])
@@ -299,7 +333,7 @@ def get_recommendations():
     token = auth_header[len('Bearer '):]
 
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=['HS265'])
+        payload = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
         email = payload.get('email')
         user = User.query.filter_by(email=email).first()
         if not user:
@@ -309,17 +343,22 @@ def get_recommendations():
         return jsonify(success=False, error='トークンの有効期限が切れています'), 401
     except jwt.InvalidTokenError:
         return jsonify(success=False, error='無効なトークンです'), 400
-    #レコメンドロジックの開始
-    # 1 ユーザーの閲覧履歴からキーワードを抽出
+    except Exception as e: # Catch any other unexpected JWT related errors
+        print(f"ERROR in get_recommendations token decoding: {e}")
+        traceback.print_exc()
+        return jsonify(success=False, error=f'トークン処理中に予期せぬエラーが発生しました: {str(e)}'), 500
+
+    # Start recommendation logic
+    # 1. Extract keywords from user browsing history
     user_views = UserActivity.query.filter_by(user_id=user_id, activity_type='view').all()
 
-    #既読記事のURLをセットに格納(重複チェック用)
+    # Store URLs of read articles in a set (for duplication check)
     viewed_article_urls = {activity.article_id for activity in user_views}
 
     keywords = {}
     for activity in user_views:
         if activity.article_title:
-        #記事タイトルをがん後に分割してキーワードとしてカウント(簡易的)
+        # Count keywords by splitting article title (simplified)
             for word in activity.article_title.split():
                 if len(word) > 2 and word.lower() not in ['の', 'に', 'は', 'が', 'を', 'と', 'で', 'も', 'から', 'まで', 'そして', 'しかし', 'ある', 'いる', 'する', 'なる', 'れる', 'など', 'こと', 'もの', 'それ']:
                     keywords[word.lower()] = keywords.get(word.lower(), 0) + 1
@@ -328,17 +367,68 @@ def get_recommendations():
                 if len(word) > 2 and word.lower() not in ['の', 'に', 'は', 'が', 'を', 'と', 'で', 'も', 'から', 'まで', 'そして', 'しかし', 'ある', 'いる', 'する', 'なる', 'れる', 'など', 'こと', 'もの', 'それ']:
                     keywords[word.lower()] = keywords.get(word.lower(), 0) + 1
 
-    #キーワードを頻度でソートし、上位のものを取得
-    #上位5つのキーワードを抽出
+    # Sort keywords by frequency and get the top ones
+    # Extract top 5 keywords
     sorted_keywords = sorted(keywords.items(), key=lambda item: item[1], reverse=True)[:5]
-    query_words = [word for word, count in sorted_ keywords]
+    query_words = [word for word, count in sorted_keywords]
 
-    recommended_articles =
+    recommended_articles = []
 
-# 簡単なテスト用エンドポイント
+    if query_words:
+        # Search for articles based on keywords using GNews API
+        search_query = ' OR '.join(query_words)
+        print(f"DEBUG: Recommended article search query: {search_query}")
+
+        url = (
+            f'https://gnews.io/api/v4/search'
+            f'?q={search_query}'
+            f'&country=jp'
+            f'&max=10'
+            f'&apikey={GNEWS_API_KEY}'
+        )
+        try:
+            response = requests.get(url)
+            data = response.json()
+
+            if data.get('articles'):
+                for article in data['articles']:
+                    # Exclude already read articles
+                    if article.get('url') not in viewed_article_urls:
+                        recommended_articles.append(article)
+                    if len(recommended_articles) >= 5: # Recommend up to 5 articles
+                        break
+        except Exception as e:
+            print(f"ERROR: An error occurred while fetching recommended articles: {e}")
+    # Fallback if no query keywords or no articles found from GNews API
+    if not recommended_articles:
+        # Fetch latest articles as fallback
+        print("DEBUG: No recommended articles found, fetching latest articles as fallback.")
+        url = (
+            f'https://gnews.io/api/v4/top-headlines'
+            f'?lang=ja'
+            f'&country=jp'
+            f'&max=5' # 5 latest articles
+            f'&apikey={GNEWS_API_KEY}'
+        )
+        try:
+            response = requests.get(url)
+            data = response.json()
+            if data.get('articles'):
+                for article in data['articles']:
+                    if article.get('url') not in viewed_article_urls: # Exclude already read articles in fallback
+                        recommended_articles.append(article)
+                    if len(recommended_articles) >= 5:
+                        break
+        except Exception as e:
+            print(f"ERROR: An error occurred while fetching fallback articles: {e}")
+
+    print(f"DEBUG: Returning {len(recommended_articles)} recommended articles.")
+    return jsonify(articles=recommended_articles)
+
+# Simple test endpoint
 @app.route('/api/hello')
 def hello():
-    return jsonify(message='Flask api返信')
+    return jsonify(message='Flask api reply')
 
 if __name__ == '__main__':
     app.run(debug=True)
