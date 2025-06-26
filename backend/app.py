@@ -112,6 +112,8 @@ def login():
         'exp': datetime.datetime.utcnow() + datetime.timedelta(minutes=15)#アクセストークンは短めに15分
     }
     access_token = jwt.encode(payload, SECRET_KEY, algorithm='HS256')
+    print(f"DEBUG:ログイン時生成米ロード:{payload}")
+    print(f"DEBUG:ログイン対象ユーザー名:{user.username},メール:{user.email}")
 
     refresh_token_payload = {
         'email': email,
@@ -201,6 +203,7 @@ def verify_token():
 
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
+        print(f"DEBUG: verify_token でデコードされたペイロード: {payload}")
         email = payload.get('email')
         user = User.query.filter_by(email=email).first()
         if not user:
