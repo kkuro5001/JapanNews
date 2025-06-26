@@ -1,4 +1,4 @@
-#python init_db.py でDBを初期化するスクリプト
+#dbモデル
 import os
 from app import app
 from db_models import db, User, UserActivity
